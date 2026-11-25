@@ -13,7 +13,7 @@
 <link rel="icon" href="icon-192.png" type="image/png">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>:root{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0;font:14px system-ui,sans-serif;background:#0A0A0A}img{max-width:100%}[hidden]{display:none!important}</style>
-<script>window.GMM_STATIC = true; window.GMM_BUILD = "2026-11-05.6";
+<script>window.GMM_STATIC = true; window.GMM_BUILD = "2026-11-25.1";
 if("serviceWorker" in navigator) addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
 if(navigator.storage&&navigator.storage.persist) navigator.storage.persist().catch(()=>{});</script>
 </head>
@@ -397,6 +397,14 @@ textarea{min-height:110px;font-family:var(--f-mono);font-size:.78rem}
           <button type="button" class="btn small" id="bk-file">Save file</button>
           <button type="button" class="btn small" id="bk-copy">Copy</button>
         </div>
+        <div id="bk-mac-wrap" style="display:grid;gap:8px">
+          <label for="bk-mac">Mac backup address<input id="bk-mac" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="https://…"></label>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button type="button" class="btn small" id="bk-mac-save">Save to Mac now</button>
+            <button type="button" class="btn small" id="bk-mac-load">Restore from Mac</button>
+          </div>
+          <p class="hint" id="bk-mac-status"></p>
+        </div>
         <label class="btn small" for="bk-load" style="justify-self:start">Load backup file<input type="file" id="bk-load" accept=".json,application/json" hidden></label>
         <label for="bk-box">Or paste backup<textarea id="bk-box"></textarea></label>
         <button type="button" class="btn small" id="bk-restore" style="justify-self:start">Restore</button>
@@ -662,7 +670,7 @@ let basis='budget'; try{basis=localStorage.getItem('runway-basis')||'budget'}cat
 const queues={};
 function save(id,data){
   docs[id]=data; render();
-  if(mode==='local'){saveLocal();autoBackup();return Promise.resolve()}
+  if(mode==='local'){saveLocal();autoBackup();macPushSoon();return Promise.resolve()}
   if(mode!=='db'){return Promise.resolve()}
   queues[id]=(queues[id]||Promise.resolve()).then(()=>col.doc(id).set(data)).catch(e=>{
     toast(e&&e.code==='quota_exceeded'?'Storage is full. Delete old entries or goals, then try again.':'That change did not save. Check your connection and try again.');
@@ -676,6 +684,7 @@ function goLocal(){
   const b=$('#store-banner');b.hidden=!!window.GMM_STATIC;
   b.textContent='Saved in this browser only. Sign in to claude.ai to sync.';
   render();
+  if(window.GMM_STATIC&&macUrl()) setTimeout(()=>macPush(),1500);
 }
 async function initStore(){
   try{
@@ -1590,13 +1599,46 @@ async function backupShare(){
   }catch(e){if(e&&e.name==='AbortError')return false}
   return false;
 }
+const macGet=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const macSet=(k,v)=>{try{v==null?localStorage.removeItem(k):localStorage.setItem(k,String(v))}catch(e){}};
+const macUrl=()=>macGet('gmm-mac')||'';
+const fmtDT=t=>new Date(+t).toLocaleString([],{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'});
+const MAC_DOWN='Mac not reachable. Check Tailscale is on and the Mac is awake.';
+function macNorm(v){
+  v=String(v||'').trim().replace(/\/+$/,''); if(!v) return '';
+  if(!/^https?:\/\//i.test(v)) v='https://'+v;
+  try{const u=new URL(v); if(/^[a-z0-9.-]+$/i.test(u.hostname)&&(u.protocol==='https:'||/^(localhost|127\.0\.0\.1)$/.test(u.hostname))) return u.origin}catch(e){}
+  return null;
+}
+function macFetch(u,opt){
+  const c=new AbortController(), t=setTimeout(()=>c.abort(),10000);
+  return fetch(u+'/api/backup',Object.assign({signal:c.signal,cache:'no-store'},opt||{})).finally(()=>clearTimeout(t));
+}
+function macStatus(msg){
+  const el=$('#bk-mac-status'); if(!el) return;
+  if(msg){el.textContent=msg;return}
+  if(!macUrl()){el.textContent='';return}
+  const last=+macGet('gmm-mac-last')||0, pend=!!macGet('gmm-mac-pending');
+  el.textContent=(last?'Saved to Mac '+fmtDT(last)+'.':'Not saved to Mac yet.')+(pend?' Mac not reachable, will retry.':'');
+}
+async function macPush(u){
+  u=u||macUrl(); if(!u||!S()) return false;
+  const body=backupText();
+  try{
+    const r=await macFetch(u,{method:'POST',headers:{'Content-Type':'text/plain'},body,keepalive:body.length<60000});
+    if(!r.ok) throw new Error('refused');
+    macSet('gmm-mac-last',Date.now());macSet('gmm-mac-pending',null);markBackup();macStatus();return true;
+  }catch(e){macSet('gmm-mac-pending','1');macStatus();return false}
+}
+let macT=null;
+function macPushSoon(){if(!window.GMM_STATIC||!macUrl())return;clearTimeout(macT);macT=setTimeout(()=>{macT=null;macPush()},1500)}
 function autoBackup(){
   if(!window.GMM_STATIC||!S()) return;
   if(Date.now()-lastBackup()<7*DAY) return;
   try{backupFile();toast('Backup saved to Downloads.','Share',()=>backupShare())}catch(e){}
 }
 function setupBackup(){
-  let armed=false;
+  let armed=false, macPendingUrl='';
   if(!window.GMM_STATIC){$('#bk-share').hidden=true;$('#bk-file').hidden=true;$('#bk-auto').hidden=true}
   $('#app-build').textContent='Version '+(window.GMM_BUILD||'web');
   $('#bk-copy').onclick=async()=>{
@@ -1613,7 +1655,55 @@ function setupBackup(){
     Object.keys(d.docs).forEach(id=>{if(/^(settings|history|goals|invest|hdb|m-\d{4}-\d{2})$/.test(id)&&d.docs[id]&&typeof d.docs[id]==='object')save(id,d.docs[id])});
     markBackup();
     settingsDirty=false;fillSettings(true);$('#bk-box').value='';$('#bk-load').value='';$('#bk-result').textContent='Restored.';
+    if(macPendingUrl){macSet('gmm-mac',macPendingUrl);macPendingUrl='';macPushSoon()}
   };
+  if(!window.GMM_STATIC) $('#bk-mac-wrap').hidden=true;
+  else {
+    const inp=$('#bk-mac'); inp.value=window.GMM_MAC_PREFILL||macUrl();
+    let okReplace=false;
+    const want=()=>{const v=macNorm(inp.value); if(v===null) macStatus('That address does not look right.'); return v};
+    $('#bk-mac-save').onclick=async()=>{
+      const u=want(); if(u===null) return;
+      if(!u){macSet('gmm-mac',null);macSet('gmm-mac-pending',null);macStatus('Mac backup is off.');return}
+      if(!S()){macStatus('Nothing to save yet. Use Restore from Mac.');return}
+      macStatus('Saving…');
+      if(u!==macUrl()&&!okReplace){
+        try{
+          const r=await macFetch(u);
+          if(r.ok){
+            const d=await r.json(), n=d&&d.docs?Object.keys(d.docs).length:0;
+            if(n>Object.keys(docs).length){okReplace=true;const at=r.headers.get('X-Saved-At');macStatus(`The Mac has a bigger backup${at?' from '+fmtDT(at):''}. Tap Restore from Mac to use it, or Save to Mac now again to replace it.`);return}
+          }
+        }catch(e){macStatus(MAC_DOWN);return}
+      }
+      okReplace=false;
+      if(await macPush(u)){macSet('gmm-mac',u);inp.value=u;macStatus()}
+      else{if(!macUrl())macSet('gmm-mac-pending',null);macStatus(MAC_DOWN)}
+    };
+    $('#bk-mac-load').onclick=async()=>{
+      let u=want(); if(u===null) return; u=u||macUrl();
+      if(!u){macStatus('Enter the Mac backup address first.');return}
+      macStatus('Loading…');
+      try{
+        const r=await macFetch(u);
+        if(r.status===404){macStatus('No backup on the Mac yet.');return}
+        if(!r.ok) throw new Error('refused');
+        const txt=await r.text(); JSON.parse(txt);
+        $('#bk-box').value=txt;armed=false;$('#bk-restore').textContent='Restore';macPendingUrl=u;
+        const at=r.headers.get('X-Saved-At');
+        macStatus(`Loaded from Mac${at?', saved '+fmtDT(at):''}. Tap Restore below.`);
+      }catch(e){macStatus(MAC_DOWN)}
+    };
+    document.addEventListener('visibilitychange',()=>{
+      if(document.hidden){if(macT){clearTimeout(macT);macT=null;macPush()}}
+      else if(macUrl()&&macGet('gmm-mac-pending')) macPush();
+    });
+    macStatus();
+    if(window.GMM_MAC_PREFILL&&window.GMM_MAC_PREFILL!==macUrl()){
+      const d=$('#settings');d.hidden=false;d.open=true;
+      setTimeout(()=>{inp.closest('section').scrollIntoView({block:'start'});macStatus('Tap Save to Mac now to turn it on.')},400);
+    }
+  }
   $('#bk-restore').onclick=()=>{let d=null;try{d=JSON.parse($('#bk-box').value)}catch(e){}restore(d)};
   $('#bk-load').onchange=()=>{
     const f=$('#bk-load').files[0];if(!f)return;
@@ -1711,6 +1801,10 @@ menu.querySelectorAll('button').forEach(b=>b.onclick=()=>{
 });
 const setBasis=b=>{basis=b;try{localStorage.setItem('runway-basis',b)}catch(e){}render()};
 $('#basis-budget').onclick=()=>setBasis('budget');$('#basis-recent').onclick=()=>setBasis('recent');
+(()=>{const m=/^#mac=([a-z0-9.-]+(?::\d{1,5})?)$/i.exec(location.hash||'');if(!m||!window.GMM_STATIC)return;
+  try{history.replaceState(null,'',location.pathname)}catch(e){}
+  window.GMM_MAC_PREFILL='https://'+m[1].toLowerCase();})();
+addEventListener('hashchange',()=>{if(/^#mac=/.test(location.hash))location.reload()});
 setupForm();setupGoals();setupSettings();setupBackup();setupPin();setupInvest();setupHdb();setupImport();
 render();
 initStore();
